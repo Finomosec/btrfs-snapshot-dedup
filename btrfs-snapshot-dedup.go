@@ -766,7 +766,11 @@ func main() {
 
 	go func() {
 		findArgs := []string{live, "-type", "f"}
-		findArgs = append(findArgs, findFilter...)
+		if len(findFilter) > 0 {
+			findArgs = append(findArgs, "(")
+			findArgs = append(findArgs, findFilter...)
+			findArgs = append(findArgs, ")")
+		}
 		fmt.Fprintf(os.Stderr, "find %s\n", strings.Join(findArgs, " "))
 
 		cmd := exec.Command("find", findArgs...)
