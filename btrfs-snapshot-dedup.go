@@ -12,6 +12,7 @@ const unsigned long IOCTL_TREE_SEARCH_V2 = BTRFS_IOC_TREE_SEARCH_V2;
 const unsigned long IOCTL_INO_LOOKUP = BTRFS_IOC_INO_LOOKUP;
 const unsigned long IOCTL_FIEMAP = FS_IOC_FIEMAP;
 const unsigned long IOCTL_FIDEDUPERANGE = FIDEDUPERANGE;
+const unsigned long IOCTL_LOGICAL_INO_V2 = BTRFS_IOC_LOGICAL_INO_V2;
 
 const int DEDUPE_RANGE_SIZE = sizeof(struct file_dedupe_range);
 const int DEDUPE_RANGE_INFO_SIZE = sizeof(struct file_dedupe_range_info);
@@ -41,6 +42,7 @@ var (
 	IOC_INO_LOOKUP      = uintptr(C.IOCTL_INO_LOOKUP)
 	IOC_FIEMAP          = uintptr(C.IOCTL_FIEMAP)
 	IOC_FIDEDUPERANGE   = uintptr(C.IOCTL_FIDEDUPERANGE)
+	IOC_LOGICAL_INO_V2  = uintptr(C.IOCTL_LOGICAL_INO_V2)
 
 	DEDUPE_RANGE_SIZE      = int(C.DEDUPE_RANGE_SIZE)
 	DEDUPE_RANGE_INFO_SIZE = int(C.DEDUPE_RANGE_INFO_SIZE)
@@ -221,6 +223,80 @@ func getFileBirthTime(path string) int64 {
 		return 0
 	}
 	return st.Ctim.Sec
+}
+
+// logicalResolve finds all files referencing a physical extent via LOGICAL_INO_V2 + INO_LOOKUP.
+// Returns absolute paths. mountFd must be an open fd to the btrfs mount point.
+func logicalResolve(mountFd int, mount string, physAddr uint64) []string {
+	le := binary.LittleEndian
+
+	// Allocate buffer: logical_ino_args (56 bytes) header + data_container + space for results
+	// We put the data_container right after the header in the same buffer
+	const headerSize = 56
+	const containerOff = 16 // inodes pointer offset in logical_ino_args
+	bufSize := headerSize + 65536 // 64KB for results
+	buf := make([]byte, bufSize)
+
+	// Fill logical_ino_args
+	le.PutUint64(buf[0:8], physAddr)                  // logical
+	le.PutUint64(buf[8:16], uint64(bufSize-headerSize)) // size (of data container)
+	// reserved[3] = 0 (already zeroed)
+	le.PutUint64(buf[32:40], 0) // flags (0 for now, could use IGNORE_OFFSET)
+	// inodes pointer = address of data container (right after header)
+	le.PutUint64(buf[40:48], uint64(uintptr(unsafe.Pointer(&buf[headerSize]))))
+
+	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(mountFd),
+		IOC_LOGICAL_INO_V2, uintptr(unsafe.Pointer(&buf[0])))
+	if errno != 0 {
+		return nil
+	}
+
+	// Parse data_container at buf[headerSize:]
+	dc := buf[headerSize:]
+	elemCnt := le.Uint32(dc[8:12])
+
+	var paths []string
+	// Each element is a triplet: (inum uint64, offset uint64, root uint64)
+	for i := uint32(0); i < elemCnt; i++ {
+		off := 16 + i*24 // 16 = data_container header, 24 = 3×uint64
+		if int(off+24) > len(dc) {
+			break
+		}
+		inum := le.Uint64(dc[off : off+8])
+		root := le.Uint64(dc[off+16 : off+24])
+
+		// INO_LOOKUP: resolve inum+root to path
+		var lookupBuf [4096]byte
+		le.PutUint64(lookupBuf[0:8], root)  // treeid
+		le.PutUint64(lookupBuf[8:16], inum) // objectid
+		_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(mountFd),
+			IOC_INO_LOOKUP, uintptr(unsafe.Pointer(&lookupBuf[0])))
+		if errno != 0 {
+			continue
+		}
+		// Name starts at offset 16, null-terminated
+		name := ""
+		for j := 16; j < len(lookupBuf); j++ {
+			if lookupBuf[j] == 0 {
+				name = string(lookupBuf[16:j])
+				break
+			}
+		}
+		if name == "" {
+			continue
+		}
+
+		// Resolve the subvol path for this root
+		subvolPath := resolveSubvolPath(mountFd, mount, root)
+		if subvolPath == "" {
+			continue
+		}
+		fullPath := mount + "/" + subvolPath + "/" + name
+		if fileExists(fullPath) {
+			paths = append(paths, fullPath)
+		}
+	}
+	return paths
 }
 
 // dedupGroup represents a set of identical files to deduplicate
@@ -901,15 +977,8 @@ func main() {
 
 		// logical-resolve on old snapshot extent → all other copies across FS
 		if physSnap > 0 {
-			out, err := exec.Command("btrfs", "inspect-internal", "logical-resolve",
-				fmt.Sprintf("%d", physSnap), mount).Output()
-			if err == nil {
-				for _, p := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-					p = strings.TrimSpace(p)
-					if p != "" && fileExists(p) {
-						group[p] = true
-					}
-				}
+			for _, p := range logicalResolve(mountFd, mount, physSnap) {
+				group[p] = true
 			}
 		}
 
