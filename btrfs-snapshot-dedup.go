@@ -48,6 +48,8 @@ var (
 	DEDUPE_RANGE_INFO_SIZE = int(C.DEDUPE_RANGE_INFO_SIZE)
 )
 
+const VERSION = "0.3.0"
+
 const (
 	QUEUE_LIMIT    = 10000
 	DEDUP_WORKERS  = 4
@@ -620,6 +622,7 @@ func main() {
 	// First two positional args are mount + subvol, rest goes to find(1)
 	args := flag.Args()
 	if len(args) < 2 {
+		fmt.Fprintf(os.Stderr, "btrfs-snapshot-dedup v%s\n\n", VERSION)
 		fmt.Fprintf(os.Stderr, "Usage: %s [options] <mount> <subvol> [find-filter...]\n\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "Options:\n")
 		flag.PrintDefaults()
@@ -711,6 +714,7 @@ func main() {
 		subvolCache[si.subvolID] = si.relPath
 	}
 
+	fmt.Fprintf(os.Stderr, "btrfs-snapshot-dedup v%s\n", VERSION)
 	fmt.Fprintf(os.Stderr, "Mount:    %s\n", mount)
 	fmt.Fprintf(os.Stderr, "Subvol:   %s (id=%d)\n", subvol, subvolID)
 	fmt.Fprintf(os.Stderr, "Snapshots: %d (%s .. %s)\n", snapCount,
@@ -768,7 +772,9 @@ func main() {
 		findArgs := []string{live, "-type", "f"}
 		if len(findFilter) > 0 {
 			findArgs = append(findArgs, "(")
-			findArgs = append(findArgs, findFilter...)
+			for _, arg := range findFilter {
+				findArgs = append(findArgs, strings.Fields(arg)...)
+			}
 			findArgs = append(findArgs, ")")
 		}
 		fmt.Fprintf(os.Stderr, "find %s\n", strings.Join(findArgs, " "))
