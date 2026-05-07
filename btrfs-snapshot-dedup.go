@@ -1000,7 +1000,7 @@ func main() {
 	fmt.Fprintln(os.Stderr, "  shared     = already shares extents with snapshot (skipped)")
 	fmt.Fprintln(os.Stderr, "  not_found  = file not found in any snapshot (skipped)")
 	fmt.Fprintln(os.Stderr, "  changed    = file size differs from snapshot (skipped)")
-	fmt.Fprintln(os.Stderr, "  pending    = groups/copies/expectedSavings(active dedup sizes big→small) waiting for dedup")
+	fmt.Fprintln(os.Stderr, "  pending    = groups/copies/expectedSavings(active dedup sizes) waiting for dedup")
 	fmt.Fprintln(os.Stderr, "  deduped    = groups/copies/saved — successfully deduplicated via FIDEDUPERANGE")
 	fmt.Fprintln(os.Stderr, "══════════════════════════════════════════════════════════════════════════════")
 
