@@ -48,7 +48,7 @@ var (
 	DEDUPE_RANGE_INFO_SIZE = int(C.DEDUPE_RANGE_INFO_SIZE)
 )
 
-const VERSION = "0.8.0"
+const VERSION = "0.8.1"
 
 const (
 	QUEUE_LIMIT    = 10000
@@ -805,8 +805,11 @@ type counters struct {
 	pending       atomic.Int64
 	pendingCopies atomic.Int64
 	pendingSaved  atomic.Int64
-	activeWorkers atomic.Int64
 	bytesSaved    atomic.Int64
+
+	// Active dedup tracking: file sizes currently being deduped
+	activeMu    sync.Mutex
+	activeSizes []int64 // sorted big→small on read
 }
 
 func printUsage() {
@@ -997,7 +1000,7 @@ func main() {
 	fmt.Fprintln(os.Stderr, "  shared     = already shares extents with snapshot (skipped)")
 	fmt.Fprintln(os.Stderr, "  not_found  = file not found in any snapshot (skipped)")
 	fmt.Fprintln(os.Stderr, "  changed    = file size differs from snapshot (skipped)")
-	fmt.Fprintln(os.Stderr, "  pending    = groups/copies/expectedSavings(activeWorkers) waiting for dedup")
+	fmt.Fprintln(os.Stderr, "  pending    = groups/copies/expectedSavings(active dedup sizes big→small) waiting for dedup")
 	fmt.Fprintln(os.Stderr, "  deduped    = groups/copies/saved — successfully deduplicated via FIDEDUPERANGE")
 	fmt.Fprintln(os.Stderr, "══════════════════════════════════════════════════════════════════════════════")
 
@@ -1127,10 +1130,24 @@ func main() {
 			}
 			saved := cnt.bytesSaved.Load()
 			pendingSaved := cnt.pendingSaved.Load()
-			fmt.Fprintf(os.Stderr, "  [%s] found=%d buf=%d checked=%s shared=%d not_found=%d changed=%d pending=%d/%d/%s(%d) deduped=%d/%d/%s%s\n",
+			// Build active sizes string (sorted big→small)
+			cnt.activeMu.Lock()
+			activeStr := ""
+			if len(cnt.activeSizes) > 0 {
+				sorted := make([]int64, len(cnt.activeSizes))
+				copy(sorted, cnt.activeSizes)
+				sort.Slice(sorted, func(i, j int) bool { return sorted[i] > sorted[j] })
+				parts := make([]string, len(sorted))
+				for i, s := range sorted {
+					parts[i] = fmtBytes(s)
+				}
+				activeStr = strings.Join(parts, ",")
+			}
+			cnt.activeMu.Unlock()
+			fmt.Fprintf(os.Stderr, "  [%s] found=%d buf=%d checked=%s shared=%d not_found=%d changed=%d pending=%d/%d/%s(%s) deduped=%d/%d/%s%s\n",
 				fmtTime(elapsed), totalFound, buf, checkedStr, cnt.shared,
 				cnt.notFound, cnt.changed,
-				cnt.pending.Load(), cnt.pendingCopies.Load(), fmtBytes(pendingSaved), cnt.activeWorkers.Load(),
+				cnt.pending.Load(), cnt.pendingCopies.Load(), fmtBytes(pendingSaved), activeStr,
 				cnt.deduped.Load(), cnt.dedupedCopies.Load(), fmtBytes(saved), etaStr)
 
 			select {
@@ -1234,7 +1251,9 @@ func main() {
 
 	// Worker function
 	doDedup := func(group dedupGroup) {
-		cnt.activeWorkers.Add(1)
+		cnt.activeMu.Lock()
+		cnt.activeSizes = append(cnt.activeSizes, group.fileSize)
+		cnt.activeMu.Unlock()
 		src := group.paths[0]
 		dsts := group.paths[1:]
 
@@ -1251,7 +1270,14 @@ func main() {
 		cnt.pending.Add(-1)
 		cnt.pendingCopies.Add(-int64(group.numCopies))
 		cnt.pendingSaved.Add(-group.estimatedSaved)
-		cnt.activeWorkers.Add(-1)
+		cnt.activeMu.Lock()
+		for i, s := range cnt.activeSizes {
+			if s == group.fileSize {
+				cnt.activeSizes = append(cnt.activeSizes[:i], cnt.activeSizes[i+1:]...)
+				break
+			}
+		}
+		cnt.activeMu.Unlock()
 		inflightRemove(group.relPath)
 	}
 
