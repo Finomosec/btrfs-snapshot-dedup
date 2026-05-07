@@ -48,7 +48,7 @@ var (
 	DEDUPE_RANGE_INFO_SIZE = int(C.DEDUPE_RANGE_INFO_SIZE)
 )
 
-const VERSION = "0.9.2"
+const VERSION = "0.10.0"
 
 const (
 	QUEUE_LIMIT    = 10000
@@ -896,6 +896,8 @@ type counters struct {
 	optLessFragmented int // source chosen because less fragmented
 	optMoreRefs      int // source chosen because more refs (tiebreaker)
 	optDefault       int // default (live file as source)
+
+	probeSkipped atomic.Int64 // groups skipped because probe dedup had 0 gain
 }
 
 func printUsage() {
@@ -1119,6 +1121,7 @@ func main() {
 	fmt.Fprintln(os.Stderr, "  checked    = processed/shared/not_found/changed")
 	fmt.Fprintln(os.Stderr, "  pending    = groups/copies/expectedSavings(active dedup sizes) waiting for dedup")
 	fmt.Fprintln(os.Stderr, "  deduped    = groups/copies/saved")
+	fmt.Fprintln(os.Stderr, "  skip       = groups skipped (probe: already same extent, file >= 1MB)")
 	fmt.Fprintln(os.Stderr, "  opt        = compressed/lessFragmented/moreRefs/default (source selection)")
 	fmt.Fprintln(os.Stderr, "══════════════════════════════════════════════════════════════════════════════")
 
@@ -1262,10 +1265,11 @@ func main() {
 				activeStr = strings.Join(parts, ",")
 			}
 			cnt.activeMu.Unlock()
-			fmt.Fprintf(os.Stderr, "  [%s] found=%d buf=%d checked=%s/%d/%d/%d pending=%d/%d/%s(%s) deduped=%d/%d/%s opt=%d/%d/%d/%d%s\n",
+			fmt.Fprintf(os.Stderr, "  [%s] found=%d buf=%d checked=%s/%d/%d/%d pending=%d/%d/%s(%s) deduped=%d/%d/%s skip=%d opt=%d/%d/%d/%d%s\n",
 				fmtTime(elapsed), totalFound, buf, checkedStr, cnt.shared, cnt.notFound, cnt.changed,
 				cnt.pending.Load(), cnt.pendingCopies.Load(), fmtBytes(pendingSaved), activeStr,
 				cnt.deduped.Load(), cnt.dedupedCopies.Load(), fmtBytes(saved),
+				cnt.probeSkipped.Load(),
 				cnt.optCompressed, cnt.optLessFragmented, cnt.optMoreRefs, cnt.optDefault, etaStr)
 
 			select {
@@ -1387,12 +1391,46 @@ func main() {
 		if debugThresholdMs > 0 {
 			dbg = debugTimed
 		}
-		n, savedBytes, err := fideduperange(src, dsts, group.estimatedSaved, dbg)
-		debugTimed(dedupStart, "fideduperange %s (%d dests, %s)", src, len(dsts), fmtBytesStatic(group.fileSize))
-		if err != nil && n == 0 {
-			fmt.Fprintf(logFile, "dedup error: %s: %v\n", src, err)
+
+		// Probe optimization: for files >= 1MB with multiple dests,
+		// FIEMAP-check src vs dests. If ALL share the same phys extent → skip group.
+		// Only check until we find one that differs (then we know dedup is needed).
+		const probeThreshold = 1024 * 1024 // 1MB
+		probeSkipped := false
+		if group.fileSize >= probeThreshold && len(dsts) > 1 {
+			probeStart := time.Now()
+			srcPhys, _, srcErr := getFirstExtentPhys(src)
+			if srcErr == nil {
+				allSame := true
+				for _, d := range dsts {
+					dPhys, _, dErr := getFirstExtentPhys(d)
+					if dErr != nil || dPhys != srcPhys {
+						allSame = false
+						break
+					}
+				}
+				if allSame {
+					cnt.probeSkipped.Add(1)
+					probeSkipped = true
+					debugTimed(probeStart, "probe skip: %s (%d dests, %s) — all same extent 0x%x", src, len(dsts), fmtBytesStatic(group.fileSize), srcPhys)
+				} else {
+					debugTimed(probeStart, "probe pass: %s (%d dests, %s) — has different extents", src, len(dsts), fmtBytesStatic(group.fileSize))
+				}
+			}
 		}
-		if n > 0 {
+
+		var n int
+		var savedBytes int64
+		var err error
+		if !probeSkipped && len(dsts) > 0 {
+			n, savedBytes, err = fideduperange(src, dsts, group.estimatedSaved, dbg)
+			debugTimed(dedupStart, "fideduperange %s (%d dests, %s)", src, len(dsts), fmtBytesStatic(group.fileSize))
+			if err != nil && n == 0 {
+				fmt.Fprintf(logFile, "dedup error: %s: %v\n", src, err)
+			}
+		}
+
+		if n > 0 || (group.fileSize >= probeThreshold && !probeSkipped) {
 			cnt.bytesSaved.Add(savedBytes)
 			writeDoneGroup(group.paths)
 		}
