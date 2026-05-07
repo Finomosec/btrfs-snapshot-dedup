@@ -48,7 +48,7 @@ var (
 	DEDUPE_RANGE_INFO_SIZE = int(C.DEDUPE_RANGE_INFO_SIZE)
 )
 
-const VERSION = "0.9.1"
+const VERSION = "0.9.2"
 
 const (
 	QUEUE_LIMIT    = 10000
@@ -890,6 +890,12 @@ type counters struct {
 	// Active dedup tracking: file sizes currently being deduped
 	activeMu    sync.Mutex
 	activeSizes []int64 // sorted big→small on read
+
+	// Source selection optimization counters
+	optCompressed    int // source chosen because compressed
+	optLessFragmented int // source chosen because less fragmented
+	optMoreRefs      int // source chosen because more refs (tiebreaker)
+	optDefault       int // default (live file as source)
 }
 
 func printUsage() {
@@ -1110,12 +1116,10 @@ func main() {
 	fmt.Fprintln(os.Stderr, "══════════════════════════════════════════════════════════════════════════════")
 	fmt.Fprintln(os.Stderr, "  found      = files matching size filter (walker progress)")
 	fmt.Fprintln(os.Stderr, "  buf        = files in queue waiting to be processed")
-	fmt.Fprintln(os.Stderr, "  checked    = files processed / total (with ETA once walker completes)")
-	fmt.Fprintln(os.Stderr, "  shared     = already shares extents with snapshot (skipped)")
-	fmt.Fprintln(os.Stderr, "  not_found  = file not found in any snapshot (skipped)")
-	fmt.Fprintln(os.Stderr, "  changed    = file size differs from snapshot (skipped)")
+	fmt.Fprintln(os.Stderr, "  checked    = processed/shared/not_found/changed")
 	fmt.Fprintln(os.Stderr, "  pending    = groups/copies/expectedSavings(active dedup sizes) waiting for dedup")
-	fmt.Fprintln(os.Stderr, "  deduped    = groups/copies/saved — successfully deduplicated via FIDEDUPERANGE")
+	fmt.Fprintln(os.Stderr, "  deduped    = groups/copies/saved")
+	fmt.Fprintln(os.Stderr, "  opt        = compressed/lessFragmented/moreRefs/default (source selection)")
 	fmt.Fprintln(os.Stderr, "══════════════════════════════════════════════════════════════════════════════")
 
 	// Binary search: find oldest snapshot containing a file
@@ -1258,11 +1262,11 @@ func main() {
 				activeStr = strings.Join(parts, ",")
 			}
 			cnt.activeMu.Unlock()
-			fmt.Fprintf(os.Stderr, "  [%s] found=%d buf=%d checked=%s shared=%d not_found=%d changed=%d pending=%d/%d/%s(%s) deduped=%d/%d/%s%s\n",
-				fmtTime(elapsed), totalFound, buf, checkedStr, cnt.shared,
-				cnt.notFound, cnt.changed,
+			fmt.Fprintf(os.Stderr, "  [%s] found=%d buf=%d checked=%s/%d/%d/%d pending=%d/%d/%s(%s) deduped=%d/%d/%s opt=%d/%d/%d/%d%s\n",
+				fmtTime(elapsed), totalFound, buf, checkedStr, cnt.shared, cnt.notFound, cnt.changed,
 				cnt.pending.Load(), cnt.pendingCopies.Load(), fmtBytes(pendingSaved), activeStr,
-				cnt.deduped.Load(), cnt.dedupedCopies.Load(), fmtBytes(saved), etaStr)
+				cnt.deduped.Load(), cnt.dedupedCopies.Load(), fmtBytes(saved),
+				cnt.optCompressed, cnt.optLessFragmented, cnt.optMoreRefs, cnt.optDefault, etaStr)
 
 			select {
 			case <-statusDone:
@@ -1602,7 +1606,9 @@ func main() {
 		bestSrc := file
 		liveInfo, liveErr := getExtentInfo(file)
 
-		if liveErr == nil && len(uniqueExtentSizes) > 0 {
+		if liveErr != nil || len(uniqueExtentSizes) == 0 {
+			cnt.optDefault++
+		} else if liveErr == nil && len(uniqueExtentSizes) > 0 {
 			// Find a representative file for the largest snapshot extent group
 			var snapRepresentative string
 			for _, s := range snaps {
@@ -1622,28 +1628,46 @@ func main() {
 
 					// Decision: prefer snapshot extent as source?
 					preferSnap := false
+					optReason := "default"
 
 					if snapInfo.compressed && !liveInfo.compressed {
-						preferSnap = true // snap is compressed, live is not
+						preferSnap = true
+						optReason = "compressed"
 					} else if !snapInfo.compressed && liveInfo.compressed {
-						preferSnap = false // live is compressed, keep it
+						preferSnap = false
+						optReason = "compressed"
 					} else {
 						// Both same compression state — check fragmentation
 						// Prefer less fragmented, but only if difference is significant (2x threshold)
 						if snapInfo.numExtents > 0 && liveInfo.numExtents > 0 {
 							if liveInfo.numExtents > snapInfo.numExtents*2 {
-								preferSnap = true // live is much more fragmented
+								preferSnap = true
+								optReason = "lessFragmented"
 							} else if snapInfo.numExtents > liveInfo.numExtents*2 {
-								preferSnap = false // snap is much more fragmented
+								preferSnap = false
+								optReason = "lessFragmented"
 							} else {
 								// Similar fragmentation — prefer more refs (less rewrite)
 								if snapRefs > liveRefs {
 									preferSnap = true
+									optReason = "moreRefs"
 								}
 							}
 						} else if snapRefs > liveRefs {
-							preferSnap = true // fallback: more refs wins
+							preferSnap = true
+							optReason = "moreRefs"
 						}
+					}
+
+					switch optReason {
+					case "compressed":
+						cnt.optCompressed++
+					case "lessFragmented":
+						cnt.optLessFragmented++
+					case "moreRefs":
+						cnt.optMoreRefs++
+					default:
+						cnt.optDefault++
 					}
 
 					if preferSnap {
