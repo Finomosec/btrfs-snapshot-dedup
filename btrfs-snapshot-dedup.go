@@ -48,7 +48,7 @@ var (
 	DEDUPE_RANGE_INFO_SIZE = int(C.DEDUPE_RANGE_INFO_SIZE)
 )
 
-const VERSION = "0.7.1"
+const VERSION = "0.8.0"
 
 const (
 	QUEUE_LIMIT    = 10000
@@ -313,6 +313,7 @@ type dedupGroup struct {
 	estimatedSaved int64    // sum of unique extent sizes (physical, from FIEMAP)
 	numCopies      int      // total copies in this group (len(paths))
 	fileSize       int64    // size of the source file (for concurrency category)
+	relPath        string   // relative path for in-flight tracking
 }
 
 // sizeCategory returns the concurrency category for a file size.
@@ -1202,57 +1203,145 @@ func main() {
 	}
 
 	// Dedup worker pool with per-category concurrency limits
-	// Category 0 (<10MB): unlimited (limited only by worker count)
-	// Category 1-3 (>=10MB): max 1 concurrent each
+	// 4 queues by size category, workers pick from large→small, fallback to cat0
+	// Category 0 (<10MB): unlimited concurrency
+	// Category 1-3 (>=10MB): max 1 concurrent per category (semaphore)
 	dedupCh := make(chan dedupGroup, 10000)
 	var dedupWg sync.WaitGroup
 
-	// Semaphores for categories 1-3 (each allows max 1 concurrent)
-	catSem := [3]chan struct{}{
-		make(chan struct{}, 1), // cat 1: 10-100MB
-		make(chan struct{}, 1), // cat 2: 100MB-1GB
-		make(chan struct{}, 1), // cat 3: >1GB
+	// Per-category queues (slice behind mutex)
+	type catQueue struct {
+		mu    sync.Mutex
+		items []dedupGroup
 	}
+	catQ := [4]*catQueue{{}, {}, {}, {}}
+	for i := range catQ {
+		catQ[i] = &catQueue{}
+	}
+
+	// Semaphores for categories 1-3 (tryAcquire/release)
+	catSem := [3]atomic.Bool{} // false = free, true = held
+
+	// Notify channel: signaled when new items are enqueued
+	notify := make(chan struct{}, 1)
+
+	notifyWorkers := func() {
+		select {
+		case notify <- struct{}{}:
+		default:
+		}
+	}
+
+	// Worker function
+	doDedup := func(group dedupGroup) {
+		cnt.activeWorkers.Add(1)
+		src := group.paths[0]
+		dsts := group.paths[1:]
+
+		n, savedBytes, err := fideduperange(src, dsts, group.estimatedSaved)
+		if err != nil && n == 0 {
+			fmt.Fprintf(logFile, "dedup error: %s: %v\n", src, err)
+		}
+		if n > 0 {
+			cnt.bytesSaved.Add(savedBytes)
+			writeDoneGroup(group.paths)
+		}
+		cnt.deduped.Add(1)
+		cnt.dedupedCopies.Add(int64(group.numCopies))
+		cnt.pending.Add(-1)
+		cnt.pendingCopies.Add(-int64(group.numCopies))
+		cnt.pendingSaved.Add(-group.estimatedSaved)
+		cnt.activeWorkers.Add(-1)
+		inflightRemove(group.relPath)
+	}
+
+	// tryPop from a category queue
+	tryPop := func(cat int) (dedupGroup, bool) {
+		q := catQ[cat]
+		q.mu.Lock()
+		defer q.mu.Unlock()
+		if len(q.items) == 0 {
+			return dedupGroup{}, false
+		}
+		g := q.items[0]
+		q.items = q.items[1:]
+		return g, true
+	}
+
+	// Worker: pick from large→small, cat0 as fallback
+	var workersDone atomic.Bool
 
 	for i := 0; i < *workers; i++ {
 		dedupWg.Add(1)
 		go func() {
 			defer dedupWg.Done()
-			for group := range dedupCh {
-				cat := sizeCategory(group.fileSize)
-
-				// Acquire semaphore for categories 1-3
-				if cat > 0 {
-					catSem[cat-1] <- struct{}{}
+			for {
+				var picked bool
+				// Try categories 3→1 (large first): only if semaphore free
+				for c := 3; c >= 1; c-- {
+					if catSem[c-1].CompareAndSwap(false, true) {
+						if g, ok := tryPop(c); ok {
+							doDedup(g)
+							catSem[c-1].Store(false)
+							notifyWorkers() // wake others, semaphore freed
+							picked = true
+							break
+						}
+						catSem[c-1].Store(false) // nothing in queue, release
+					}
+				}
+				if picked {
+					continue
 				}
 
-				cnt.activeWorkers.Add(1)
-				src := group.paths[0]
-				dsts := group.paths[1:]
-
-				n, savedBytes, err := fideduperange(src, dsts, group.estimatedSaved)
-				if err != nil && n == 0 {
-					fmt.Fprintf(logFile, "dedup error: %s: %v\n", src, err)
+				// Fallback: cat0 (unlimited, no semaphore)
+				if g, ok := tryPop(0); ok {
+					doDedup(g)
+					continue
 				}
-				if n > 0 {
-					cnt.bytesSaved.Add(savedBytes)
-					writeDoneGroup(group.paths)
-				}
-				cnt.deduped.Add(1)
-				cnt.dedupedCopies.Add(int64(group.numCopies))
-				cnt.pending.Add(-1)
-				cnt.pendingCopies.Add(-int64(group.numCopies))
-				cnt.pendingSaved.Add(-group.estimatedSaved)
-				cnt.activeWorkers.Add(-1)
-				inflightRemove(strings.TrimPrefix(src, live+"/"))
 
-				// Release semaphore
-				if cat > 0 {
-					<-catSem[cat-1]
+				// Nothing available — wait for notification or exit
+				if workersDone.Load() {
+					// Check once more before exiting
+					empty := true
+					for c := 0; c < 4; c++ {
+						catQ[c].mu.Lock()
+						if len(catQ[c].items) > 0 {
+							empty = false
+						}
+						catQ[c].mu.Unlock()
+					}
+					if empty {
+						return
+					}
+					continue
+				}
+				select {
+				case <-notify:
+				case <-time.After(100 * time.Millisecond):
 				}
 			}
 		}()
 	}
+
+	// Dispatcher: reads from dedupCh, routes to category queues
+	dedupWg.Add(1)
+	go func() {
+		defer dedupWg.Done()
+		for group := range dedupCh {
+			cat := sizeCategory(group.fileSize)
+			q := catQ[cat]
+			q.mu.Lock()
+			q.items = append(q.items, group)
+			q.mu.Unlock()
+			notifyWorkers()
+		}
+		workersDone.Store(true)
+		// Wake all workers so they can exit
+		for i := 0; i < *workers; i++ {
+			notifyWorkers()
+		}
+	}()
 
 	// Handle SIGINT/SIGTERM
 	sigCh := make(chan os.Signal, 1)
@@ -1361,8 +1450,9 @@ func main() {
 			estSaved += physLen
 		}
 		cnt.pendingSaved.Add(estSaved)
-		inflightAdd(strings.TrimPrefix(file, live+"/"))
-		dedupCh <- dedupGroup{paths: paths, estimatedSaved: estSaved, numCopies: len(paths), fileSize: sizeLive}
+		relFile := strings.TrimPrefix(file, live+"/")
+		inflightAdd(relFile)
+		dedupCh <- dedupGroup{paths: paths, estimatedSaved: estSaved, numCopies: len(paths), fileSize: sizeLive, relPath: relFile}
 	}
 
 	// Consumer: read from SpillQueue
