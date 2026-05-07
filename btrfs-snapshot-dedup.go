@@ -48,11 +48,11 @@ var (
 	DEDUPE_RANGE_INFO_SIZE = int(C.DEDUPE_RANGE_INFO_SIZE)
 )
 
-const VERSION = "0.6.1"
+const VERSION = "0.7.0"
 
 const (
 	QUEUE_LIMIT    = 10000
-	DEDUP_WORKERS  = 1
+	DEDUP_WORKERS  = 4
 
 	SEARCH_KEY_SIZE    = C.sizeof_struct_btrfs_ioctl_search_key
 	SEARCH_HEADER_SIZE = 32 // btrfs_ioctl_search_header is not in uapi, always 32
@@ -312,6 +312,25 @@ type dedupGroup struct {
 	paths          []string // first path is src, rest are dests
 	estimatedSaved int64    // sum of unique extent sizes (physical, from FIEMAP)
 	numCopies      int      // total copies in this group (len(paths))
+	fileSize       int64    // size of the source file (for concurrency category)
+}
+
+// sizeCategory returns the concurrency category for a file size.
+// Category 0 (<10MB): unlimited concurrency
+// Category 1 (10-100MB): max 1 concurrent
+// Category 2 (100MB-1GB): max 1 concurrent
+// Category 3 (>1GB): max 1 concurrent
+func sizeCategory(size int64) int {
+	switch {
+	case size < 10*1024*1024:
+		return 0
+	case size < 100*1024*1024:
+		return 1
+	case size < 1024*1024*1024:
+		return 2
+	default:
+		return 3
+	}
 }
 
 // fideduperange calls the FIDEDUPERANGE ioctl: dedup src into multiple dests.
@@ -1152,15 +1171,31 @@ func main() {
 		doneMu.Unlock()
 	}
 
-	// Dedup worker pool
+	// Dedup worker pool with per-category concurrency limits
+	// Category 0 (<10MB): unlimited (limited only by worker count)
+	// Category 1-3 (>=10MB): max 1 concurrent each
 	dedupCh := make(chan dedupGroup, 10000)
 	var dedupWg sync.WaitGroup
+
+	// Semaphores for categories 1-3 (each allows max 1 concurrent)
+	catSem := [3]chan struct{}{
+		make(chan struct{}, 1), // cat 1: 10-100MB
+		make(chan struct{}, 1), // cat 2: 100MB-1GB
+		make(chan struct{}, 1), // cat 3: >1GB
+	}
 
 	for i := 0; i < *workers; i++ {
 		dedupWg.Add(1)
 		go func() {
 			defer dedupWg.Done()
 			for group := range dedupCh {
+				cat := sizeCategory(group.fileSize)
+
+				// Acquire semaphore for categories 1-3
+				if cat > 0 {
+					catSem[cat-1] <- struct{}{}
+				}
+
 				cnt.activeWorkers.Add(1)
 				src := group.paths[0]
 				dsts := group.paths[1:]
@@ -1179,6 +1214,11 @@ func main() {
 				cnt.pendingCopies.Add(-int64(group.numCopies))
 				cnt.pendingSaved.Add(-group.estimatedSaved)
 				cnt.activeWorkers.Add(-1)
+
+				// Release semaphore
+				if cat > 0 {
+					<-catSem[cat-1]
+				}
 			}
 		}()
 	}
@@ -1290,7 +1330,7 @@ func main() {
 			estSaved += physLen
 		}
 		cnt.pendingSaved.Add(estSaved)
-		dedupCh <- dedupGroup{paths: paths, estimatedSaved: estSaved, numCopies: len(paths)}
+		dedupCh <- dedupGroup{paths: paths, estimatedSaved: estSaved, numCopies: len(paths), fileSize: sizeLive}
 	}
 
 	// Consumer: read from SpillQueue
