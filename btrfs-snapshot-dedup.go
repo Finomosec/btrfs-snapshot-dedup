@@ -490,16 +490,27 @@ func fideduperange(srcPath string, dstPaths []string, fileSize int64, dbg debugT
 		return 0, 0, nil
 	}
 
-	// Background goroutine: re-read src + current dst every 5s to keep both
-	// in page cache. Without this, pages get evicted during long ioctl calls.
+	// Prefetch source into page cache before starting any dedup.
+	// Background goroutine then re-reads src + current dst every 5s to keep warm.
+	t = time.Now()
+	prefetchIntoCache(srcFd, srcSize, nil)
+	if dbg != nil {
+		dbg(t, "[%s] prefetch src %s", fmtBytesStatic(srcSize), srcPath)
+	}
+
 	stopRefresh := make(chan struct{})
 	var currentDstPath atomic.Value // stores string
 	go func() {
 		for {
+			select {
+			case <-stopRefresh:
+				return
+			case <-time.After(5 * time.Second):
+			}
 			t0 := time.Now()
 			prefetchIntoCache(srcFd, srcSize, stopRefresh)
 			if dbg != nil {
-				dbg(t0, "[%s] prefetch src %s", fmtBytesStatic(srcSize), srcPath)
+				dbg(t0, "[%s] prefetch src (refresh) %s", fmtBytesStatic(srcSize), srcPath)
 			}
 			if dp, ok := currentDstPath.Load().(string); ok && dp != "" {
 				t1 := time.Now()
@@ -511,11 +522,6 @@ func fideduperange(srcPath string, dstPaths []string, fileSize int64, dbg debugT
 						dbg(t1, "[%s] prefetch dst (refresh) %s", fmtBytesStatic(srcSize), dp)
 					}
 				}
-			}
-			select {
-			case <-stopRefresh:
-				return
-			case <-time.After(5 * time.Second):
 			}
 		}
 	}()
