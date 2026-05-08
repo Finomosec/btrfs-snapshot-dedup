@@ -48,7 +48,7 @@ var (
 	DEDUPE_RANGE_INFO_SIZE = int(C.DEDUPE_RANGE_INFO_SIZE)
 )
 
-const VERSION = "0.10.4"
+const VERSION = "0.11.0"
 
 const (
 	QUEUE_LIMIT    = 10000
@@ -395,13 +395,76 @@ func sizeCategory(size int64) int {
 	}
 }
 
-// fideduperange calls the FIDEDUPERANGE ioctl: dedup src into multiple dests.
-// estimatedSaved is pre-calculated from sum of unique extent physical sizes.
-// Returns (number of successfully deduped dests, estimated bytes saved).
 // debugTimedFn is a function type for debug timing. nil = no debug.
 type debugTimedFn func(start time.Time, format string, args ...interface{}) time.Duration
 
-func fideduperange(srcPath string, dstPaths []string, estimatedSaved int64, dbg debugTimedFn) (int, int64, error) {
+// dedupBatch calls FIDEDUPERANGE for a batch of dests against an open src fd.
+// Returns (number of successfully deduped dests, bytes_deduped from first success).
+func dedupBatch(srcFd int, srcSize int64, dstPaths []string, dbg debugTimedFn) (int, int64, error) {
+	if len(dstPaths) == 0 {
+		return 0, 0, nil
+	}
+
+	bufSize := DEDUPE_RANGE_SIZE + len(dstPaths)*DEDUPE_RANGE_INFO_SIZE
+	buf := make([]byte, bufSize)
+	le := binary.LittleEndian
+
+	le.PutUint64(buf[0:8], 0)                          // src_offset
+	le.PutUint64(buf[8:16], uint64(srcSize))            // src_length
+	le.PutUint16(buf[16:18], uint16(len(dstPaths)))     // dest_count
+
+	t := time.Now()
+	dstFds := make([]int, len(dstPaths))
+	for j, dstPath := range dstPaths {
+		fd, err := syscall.Open(dstPath, syscall.O_RDONLY, 0)
+		if err != nil {
+			dstFds[j] = -1
+			continue
+		}
+		dstFds[j] = fd
+		off := DEDUPE_RANGE_SIZE + j*DEDUPE_RANGE_INFO_SIZE
+		le.PutUint64(buf[off:off+8], uint64(fd))
+		le.PutUint64(buf[off+8:off+16], 0)
+		le.PutUint64(buf[off+16:off+24], 0)
+		le.PutUint32(buf[off+24:off+28], 0)
+	}
+	if dbg != nil {
+		dbg(t, "open %d dests", len(dstPaths))
+	}
+
+	t = time.Now()
+	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(srcFd),
+		IOC_FIDEDUPERANGE, uintptr(unsafe.Pointer(&buf[0])))
+	if dbg != nil {
+		dbg(t, "ioctl FIDEDUPERANGE %d dests, srcSize=%d", len(dstPaths), srcSize)
+	}
+
+	deduped := 0
+	var firstBytesDeduped int64
+	for j := range dstPaths {
+		if dstFds[j] >= 0 {
+			off := DEDUPE_RANGE_SIZE + j*DEDUPE_RANGE_INFO_SIZE
+			status := int32(le.Uint32(buf[off+24 : off+28]))
+			bytesDeduped := int64(le.Uint64(buf[off+16 : off+24]))
+			if errno == 0 && status == 0 && bytesDeduped > 0 {
+				deduped++
+				if firstBytesDeduped == 0 {
+					firstBytesDeduped = bytesDeduped
+				}
+			}
+			syscall.Close(dstFds[j])
+		}
+	}
+	if errno != 0 {
+		return deduped, firstBytesDeduped, errno
+	}
+	return deduped, firstBytesDeduped, nil
+}
+
+// fideduperange deduplicates src against dsts, grouped by physical extent.
+// For files >= 1MB: probe 1 dest per phys group first, skip if content differs.
+// Returns (total deduped dests, total actual bytes saved).
+func fideduperange(srcPath string, dstPaths []string, fileSize int64, dbg debugTimedFn) (int, int64, error) {
 	t := time.Now()
 	srcFd, err := syscall.Open(srcPath, syscall.O_RDONLY, 0)
 	if dbg != nil {
@@ -421,9 +484,44 @@ func fideduperange(srcPath string, dstPaths []string, estimatedSaved int64, dbg 
 		return 0, 0, nil
 	}
 
-	deduped := 0
-	// Batch by: max 120 dests (page limit) AND max ~2GiB total data per batch.
-	// This prevents FIDEDUPERANGE from blocking for hours on large files × many dests.
+	// Group dests by physical extent address
+	type physGroup struct {
+		phys  uint64
+		paths []string
+	}
+	var groups []physGroup
+	unknownGroup := &physGroup{phys: 0} // dests where FIEMAP failed
+
+	if fileSize >= 1024*1024 && len(dstPaths) > 1 {
+		physMap := make(map[uint64]*physGroup)
+		for _, dp := range dstPaths {
+			phys, _, err := getFirstExtentPhys(dp)
+			if err != nil {
+				unknownGroup.paths = append(unknownGroup.paths, dp)
+				continue
+			}
+			pg, ok := physMap[phys]
+			if !ok {
+				pg = &physGroup{phys: phys}
+				physMap[phys] = pg
+				groups = append(groups, *pg)
+			}
+			pg.paths = append(pg.paths, dp)
+		}
+		// Rebuild groups slice with actual data (physMap has pointers)
+		groups = groups[:0]
+		for _, pg := range physMap {
+			groups = append(groups, *pg)
+		}
+		if len(unknownGroup.paths) > 0 {
+			groups = append(groups, *unknownGroup)
+		}
+	} else {
+		// Small files or single dest: one group, no probe
+		groups = []physGroup{{phys: 0, paths: dstPaths}}
+	}
+
+	// Batching limits
 	const maxBatchBytes = 2 * 1024 * 1024 * 1024 // 2 GiB
 	maxDestsPerBatch := 120
 	if srcSize > 0 {
@@ -436,70 +534,43 @@ func fideduperange(srcPath string, dstPaths []string, estimatedSaved int64, dbg 
 		}
 	}
 
-	for i := 0; i < len(dstPaths); i += maxDestsPerBatch {
-		end := i + maxDestsPerBatch
-		if end > len(dstPaths) {
-			end = len(dstPaths)
+	totalDeduped := 0
+	var totalSaved int64
+
+	for _, pg := range groups {
+		if len(pg.paths) == 0 {
+			continue
 		}
-		batch := dstPaths[i:end]
 
-		bufSize := DEDUPE_RANGE_SIZE + len(batch)*DEDUPE_RANGE_INFO_SIZE
-		buf := make([]byte, bufSize)
-		le := binary.LittleEndian
-
-		// file_dedupe_range header
-		le.PutUint64(buf[0:8], 0)                        // src_offset
-		le.PutUint64(buf[8:16], uint64(srcSize))          // src_length
-		le.PutUint16(buf[16:18], uint16(len(batch)))      // dest_count
-
-		// Open dest fds (O_RDONLY — works on read-only snapshots)
-		t = time.Now()
-		dstFds := make([]int, len(batch))
-		for j, dstPath := range batch {
-			tOpen := time.Now()
-			fd, err := syscall.Open(dstPath, syscall.O_RDONLY, 0)
+		// Probe: dedup first dest in this phys group
+		probeN, probeSaved, probeErr := dedupBatch(srcFd, srcSize, pg.paths[:1], dbg)
+		if probeErr != nil || probeN == 0 {
+			// Content differs or error — skip this phys group
 			if dbg != nil {
-				dbg(tOpen, "open dst[%d] %s", j, dstPath)
+				dbg(time.Now(), "probe skip phys=0x%x (%d dests)", pg.phys, len(pg.paths))
 			}
+			continue
+		}
+
+		totalDeduped += probeN
+		totalSaved += probeSaved
+
+		// Dedup remaining dests in this phys group (same content confirmed, no saved increment)
+		remaining := pg.paths[1:]
+		for i := 0; i < len(remaining); i += maxDestsPerBatch {
+			end := i + maxDestsPerBatch
+			if end > len(remaining) {
+				end = len(remaining)
+			}
+			n, _, err := dedupBatch(srcFd, srcSize, remaining[i:end], dbg)
 			if err != nil {
-				dstFds[j] = -1
-				continue
+				break
 			}
-			dstFds[j] = fd
-			off := DEDUPE_RANGE_SIZE + j*DEDUPE_RANGE_INFO_SIZE
-			le.PutUint64(buf[off:off+8], uint64(fd)) // dest_fd
-			le.PutUint64(buf[off+8:off+16], 0)       // dest_offset
-			le.PutUint64(buf[off+16:off+24], 0)       // bytes_deduped (out)
-			le.PutUint32(buf[off+24:off+28], 0)       // status (out)
-		}
-		if dbg != nil {
-			dbg(t, "open %d dests (batch %d/%d)", len(batch), i/maxDestsPerBatch+1, (len(dstPaths)+maxDestsPerBatch-1)/maxDestsPerBatch)
-		}
-
-		t = time.Now()
-		_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(srcFd),
-			IOC_FIDEDUPERANGE, uintptr(unsafe.Pointer(&buf[0])))
-		if dbg != nil {
-			dbg(t, "ioctl FIDEDUPERANGE batch %d dests, srcSize=%d", len(batch), srcSize)
-		}
-
-		// Count successes and close fds
-		for j := range batch {
-			if dstFds[j] >= 0 {
-				off := DEDUPE_RANGE_SIZE + j*DEDUPE_RANGE_INFO_SIZE
-				status := int32(le.Uint32(buf[off+24 : off+28]))
-				bytesDeduped := int64(le.Uint64(buf[off+16 : off+24]))
-				if errno == 0 && status == 0 && bytesDeduped > 0 {
-					deduped++
-				}
-				syscall.Close(dstFds[j])
-			}
-		}
-		if errno != 0 {
-			return deduped, estimatedSaved, errno
+			totalDeduped += n
 		}
 	}
-	return deduped, estimatedSaved, nil
+
+	return totalDeduped, totalSaved, nil
 }
 
 type snapshotInfo struct {
@@ -1392,42 +1463,17 @@ func main() {
 			dbg = debugTimed
 		}
 
-		// Probe optimization: for files >= 1MB with multiple dests,
-		// FIDEDUPERANGE with just 1 dest first. If bytes_deduped==0 → content
-		// differs, skip entire group. If >0 → content identical, dedup rest.
-		const probeThreshold = 1024 * 1024 // 1MB
-		probeSkipped := false
-		if group.fileSize >= probeThreshold && len(dsts) > 1 {
-			probeStart := time.Now()
-			probeN, _, probeErr := fideduperange(src, dsts[:1], 0, dbg)
-			if probeErr == nil && probeN == 0 {
-				// Content differs — skip entire group
-				cnt.probeSkipped.Add(1)
-				probeSkipped = true
-				debugTimed(probeStart, "probe skip: %s (%d dests, %s) — content differs", src, len(dsts), fmtBytesStatic(group.fileSize))
-			} else if probeN > 0 {
-				// Content identical — first dest already deduped, do the rest
-				dsts = dsts[1:]
-				debugTimed(probeStart, "probe pass: %s (%d remaining dests, %s)", src, len(dsts), fmtBytesStatic(group.fileSize))
-			}
+		n, savedBytes, err := fideduperange(src, dsts, group.fileSize, dbg)
+		debugTimed(dedupStart, "fideduperange %s (%d dests, %s)", src, len(dsts), fmtBytesStatic(group.fileSize))
+		if err != nil && n == 0 {
+			fmt.Fprintf(logFile, "dedup error: %s: %v\n", src, err)
 		}
 
-		var n int
-		var savedBytes int64
-		var err error
-		if !probeSkipped && len(dsts) > 0 {
-			n, savedBytes, err = fideduperange(src, dsts, group.estimatedSaved, dbg)
-			debugTimed(dedupStart, "fideduperange %s (%d dests, %s)", src, len(dsts), fmtBytesStatic(group.fileSize))
-			if err != nil && n == 0 {
-				fmt.Fprintf(logFile, "dedup error: %s: %v\n", src, err)
-			}
-		}
-
-		if !probeSkipped {
-			if savedBytes > 0 {
-				cnt.bytesSaved.Add(savedBytes)
-			}
+		if n > 0 {
+			cnt.bytesSaved.Add(savedBytes)
 			writeDoneGroup(group.paths)
+		} else if n == 0 && len(dsts) > 0 {
+			cnt.probeSkipped.Add(1)
 		}
 		cnt.deduped.Add(1)
 		cnt.dedupedCopies.Add(int64(group.numCopies))
