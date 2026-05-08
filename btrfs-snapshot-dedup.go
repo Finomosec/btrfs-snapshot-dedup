@@ -1734,6 +1734,11 @@ func main() {
 		// Write to candidates.fdupes immediately
 		writeFdupesGroup(paths)
 
+		// Backpressure: wait if pending >= 10k (like CD burn buffer)
+		for cnt.pending.Load() >= int64(QUEUE_LIMIT) {
+			time.Sleep(100 * time.Millisecond)
+		}
+
 		// Send to dedup worker pool
 		cnt.pending.Add(1)
 		cnt.pendingCopies.Add(int64(len(paths)))
