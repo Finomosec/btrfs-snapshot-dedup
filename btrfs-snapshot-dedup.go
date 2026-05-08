@@ -380,15 +380,18 @@ type dedupGroup struct {
 // sizeCategory returns the concurrency category for a file size.
 // Category 0 (<10MB): unlimited concurrency
 // Category 1 (10-100MB): max 1 concurrent
-// Category 2 (>=100MB): max 1 concurrent
+// Category 2 (100MB-1GB): max 1 concurrent
+// Category 3 (>1GB): max 1 concurrent
 func sizeCategory(size int64) int {
 	switch {
 	case size < 10*1024*1024:
 		return 0
 	case size < 100*1024*1024:
 		return 1
-	default:
+	case size < 1024*1024*1024:
 		return 2
+	default:
+		return 3
 	}
 }
 
@@ -1402,9 +1405,9 @@ func main() {
 	}
 
 	// Dedup worker pool with per-category concurrency limits
-	// 3 queues by size category, workers pick from large→small, fallback to cat0
+	// 4 queues by size category, workers pick from large→small, fallback to cat0
 	// Category 0 (<10MB): unlimited concurrency
-	// Category 1-2 (>=10MB): max 1 concurrent per category (semaphore)
+	// Category 1-3 (>=10MB): max 1 concurrent per category (semaphore)
 	dedupCh := make(chan dedupGroup, 10000)
 	var dedupWg sync.WaitGroup
 
@@ -1413,13 +1416,13 @@ func main() {
 		mu    sync.Mutex
 		items []dedupGroup
 	}
-	catQ := [3]*catQueue{{}, {}, {}}
+	catQ := [4]*catQueue{{}, {}, {}, {}}
 	for i := range catQ {
 		catQ[i] = &catQueue{}
 	}
 
-	// Semaphores for categories 1-2 (tryAcquire/release)
-	catSem := [2]atomic.Bool{} // false = free, true = held
+	// Semaphores for categories 1-3 (tryAcquire/release)
+	catSem := [3]atomic.Bool{} // false = free, true = held
 
 	// Notify channel: signaled when new items are enqueued
 	notify := make(chan struct{}, 1)
@@ -1495,8 +1498,8 @@ func main() {
 			defer dedupWg.Done()
 			for {
 				var picked bool
-				// Try categories 2→1 (large first): only if semaphore free
-				for c := 2; c >= 1; c-- {
+				// Try categories 3→1 (large first): only if semaphore free
+				for c := 3; c >= 1; c-- {
 					if catSem[c-1].CompareAndSwap(false, true) {
 						if g, ok := tryPop(c); ok {
 							doDedup(g)
@@ -1522,7 +1525,7 @@ func main() {
 				if workersDone.Load() {
 					// Check once more before exiting
 					empty := true
-					for c := 0; c < 3; c++ {
+					for c := 0; c < 4; c++ {
 						catQ[c].mu.Lock()
 						if len(catQ[c].items) > 0 {
 							empty = false
