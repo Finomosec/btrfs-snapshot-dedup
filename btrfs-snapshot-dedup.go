@@ -48,7 +48,7 @@ var (
 	DEDUPE_RANGE_INFO_SIZE = int(C.DEDUPE_RANGE_INFO_SIZE)
 )
 
-const VERSION = "1.0.0"
+const VERSION = "1.1.0"
 
 const (
 	QUEUE_LIMIT    = 10000
@@ -466,11 +466,16 @@ func fideduperange(srcPath string, dstPaths []string, fileSize int64, dbg debugT
 		return 0, 0, nil
 	}
 
-	// Readahead source into page cache (async, non-blocking)
+	// Prefetch source into page cache (async, non-blocking)
+	// fadvise WILLNEED has no size limit unlike readahead (limited by read_ahead_kb)
 	t = time.Now()
-	syscall.Syscall(syscall.SYS_READAHEAD, uintptr(srcFd), 0, uintptr(srcSize))
-	if dbg != nil {
-		dbg(t, "readahead src %s (%s)", srcPath, fmtBytesStatic(srcSize))
+	_, _, errno := syscall.Syscall6(syscall.SYS_FADVISE64, uintptr(srcFd), 0, uintptr(srcSize), 3 /*FADV_WILLNEED*/, 0, 0)
+	if errno != 0 {
+		if dbg != nil {
+			dbg(t, "fadvise src FAILED: errno=%d %s", errno, srcPath)
+		}
+	} else if dbg != nil {
+		dbg(t, "fadvise src %s (%s)", srcPath, fmtBytesStatic(srcSize))
 	}
 
 	// Get phys addr for each dest and sort by it
@@ -499,15 +504,19 @@ func fideduperange(srcPath string, dstPaths []string, fileSize int64, dbg debugT
 			continue // content differs for this phys addr — skip
 		}
 
-		// Readahead dest (async)
+		// Prefetch dest into page cache (async, non-blocking)
 		tRA := time.Now()
 		dstFd, err := syscall.Open(d.path, syscall.O_RDONLY, 0)
 		if err == nil {
-			syscall.Syscall(syscall.SYS_READAHEAD, uintptr(dstFd), 0, uintptr(srcSize))
-			syscall.Close(dstFd)
-			if dbg != nil {
-				dbg(tRA, "readahead dst %s", d.path)
+			_, _, eno := syscall.Syscall6(syscall.SYS_FADVISE64, uintptr(dstFd), 0, uintptr(srcSize), 3 /*FADV_WILLNEED*/, 0, 0)
+			if eno != 0 {
+				if dbg != nil {
+					dbg(tRA, "fadvise dst FAILED: errno=%d %s", eno, d.path)
+				}
+			} else if dbg != nil {
+				dbg(tRA, "fadvise dst %s", d.path)
 			}
+			syscall.Close(dstFd)
 		}
 
 		n, bytesDeduped, err := dedupSingle(srcFd, srcSize, d.path, dbg)
@@ -1043,6 +1052,8 @@ func main() {
 	}
 	defer syscall.Close(mountFd)
 
+	fmt.Fprintf(os.Stderr, "btrfs-snapshot-dedup v%s\n", VERSION)
+
 	// Enumerate ALL subvols on the FS (one tree-search pass) so we can handle
 	// nested subvols inside the live tree — their snapshots have a different
 	// parent_uuid and live elsewhere on disk.
@@ -1135,7 +1146,6 @@ func main() {
 		}
 	}
 
-	fmt.Fprintf(os.Stderr, "btrfs-snapshot-dedup v%s\n", VERSION)
 	fmt.Fprintf(os.Stderr, "Mount:    %s\n", mount)
 	fmt.Fprintf(os.Stderr, "Subvol:   %s (id=%d) + %d nested subvol(s)\n",
 		subvol, subvolID, len(liveMap)-1)
