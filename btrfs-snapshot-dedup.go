@@ -505,7 +505,7 @@ func fideduperange(srcPath string, dstPaths []string, fileSize int64, dbg debugT
 			select {
 			case <-stopRefresh:
 				return
-			case <-time.After(5 * time.Second):
+			case <-time.After(10 * time.Second):
 			}
 			t0 := time.Now()
 			prefetchIntoCache(srcFd, srcSize, stopRefresh)
