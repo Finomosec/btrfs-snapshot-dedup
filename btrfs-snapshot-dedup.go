@@ -48,7 +48,7 @@ var (
 	DEDUPE_RANGE_INFO_SIZE = int(C.DEDUPE_RANGE_INFO_SIZE)
 )
 
-const VERSION = "0.10.3"
+const VERSION = "0.10.4"
 
 const (
 	QUEUE_LIMIT    = 10000
@@ -1397,10 +1397,9 @@ func main() {
 		// differs, skip entire group. If >0 → content identical, dedup rest.
 		const probeThreshold = 1024 * 1024 // 1MB
 		probeSkipped := false
-		var probeSaved int64
 		if group.fileSize >= probeThreshold && len(dsts) > 1 {
 			probeStart := time.Now()
-			probeN, pSaved, probeErr := fideduperange(src, dsts[:1], group.estimatedSaved, dbg)
+			probeN, _, probeErr := fideduperange(src, dsts[:1], 0, dbg)
 			if probeErr == nil && probeN == 0 {
 				// Content differs — skip entire group
 				cnt.probeSkipped.Add(1)
@@ -1408,7 +1407,6 @@ func main() {
 				debugTimed(probeStart, "probe skip: %s (%d dests, %s) — content differs", src, len(dsts), fmtBytesStatic(group.fileSize))
 			} else if probeN > 0 {
 				// Content identical — first dest already deduped, do the rest
-				probeSaved = pSaved
 				dsts = dsts[1:]
 				debugTimed(probeStart, "probe pass: %s (%d remaining dests, %s)", src, len(dsts), fmtBytesStatic(group.fileSize))
 			}
@@ -1419,7 +1417,6 @@ func main() {
 		var err error
 		if !probeSkipped && len(dsts) > 0 {
 			n, savedBytes, err = fideduperange(src, dsts, group.estimatedSaved, dbg)
-			savedBytes += probeSaved
 			debugTimed(dedupStart, "fideduperange %s (%d dests, %s)", src, len(dsts), fmtBytesStatic(group.fileSize))
 			if err != nil && n == 0 {
 				fmt.Fprintf(logFile, "dedup error: %s: %v\n", src, err)
@@ -1427,9 +1424,8 @@ func main() {
 		}
 
 		if !probeSkipped {
-			totalSaved := savedBytes + probeSaved
-			if totalSaved > 0 {
-				cnt.bytesSaved.Add(totalSaved)
+			if savedBytes > 0 {
+				cnt.bytesSaved.Add(savedBytes)
 			}
 			writeDoneGroup(group.paths)
 		}
