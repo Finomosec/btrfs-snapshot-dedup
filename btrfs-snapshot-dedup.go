@@ -1841,7 +1841,8 @@ done:
 			resumePoint = lastFile
 		}
 		if resumePoint != "" {
-			fmt.Fprintf(os.Stderr, "\n  Resume with: -start-at='%s'\n", resumePoint)
+			escaped := strings.ReplaceAll(resumePoint, "'", "'\\''")
+			fmt.Fprintf(os.Stderr, "\n  Resume with: -start-at='%s'\n", escaped)
 			fmt.Fprintf(os.Stderr, "  Unprocessed candidates in candidates.fdupes, done in candidates.done\n")
 		}
 	}
