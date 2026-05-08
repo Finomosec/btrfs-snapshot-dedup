@@ -490,16 +490,27 @@ func fideduperange(srcPath string, dstPaths []string, fileSize int64, dbg debugT
 		return 0, 0, nil
 	}
 
-	// Background goroutine: prefetch source into page cache via pread (brute force),
-	// then re-read every 5s to keep it hot. Initial read runs parallel with first
-	// dest prefetch. fadvise/readahead may be ignored by btrfs (low ioprio).
+	// Background goroutine: re-read src + current dst every 5s to keep both
+	// in page cache. Without this, pages get evicted during long ioctl calls.
 	stopRefresh := make(chan struct{})
+	var currentDstPath atomic.Value // stores string
 	go func() {
 		for {
 			t0 := time.Now()
 			prefetchIntoCache(srcFd, srcSize, stopRefresh)
 			if dbg != nil {
 				dbg(t0, "[%s] prefetch src %s", fmtBytesStatic(srcSize), srcPath)
+			}
+			if dp, ok := currentDstPath.Load().(string); ok && dp != "" {
+				t1 := time.Now()
+				dfd, err := syscall.Open(dp, syscall.O_RDONLY, 0)
+				if err == nil {
+					prefetchIntoCache(dfd, srcSize, stopRefresh)
+					syscall.Close(dfd)
+					if dbg != nil {
+						dbg(t1, "[%s] prefetch dst (refresh) %s", fmtBytesStatic(srcSize), dp)
+					}
+				}
 			}
 			select {
 			case <-stopRefresh:
@@ -546,6 +557,7 @@ func fideduperange(srcPath string, dstPaths []string, fileSize int64, dbg debugT
 			}
 		}
 
+		currentDstPath.Store(d.path)
 		n, bytesDeduped, err := dedupSingle(srcFd, srcSize, d.path, dbg)
 		if err != nil {
 			continue
