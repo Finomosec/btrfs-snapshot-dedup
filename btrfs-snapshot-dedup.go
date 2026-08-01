@@ -48,7 +48,7 @@ var (
 	DEDUPE_RANGE_INFO_SIZE = int(C.DEDUPE_RANGE_INFO_SIZE)
 )
 
-const VERSION = "1.5.1"
+const VERSION = "1.5.2"
 
 const (
 	QUEUE_LIMIT    = 10000
@@ -981,6 +981,29 @@ func printUsage() {
 	fmt.Fprintf(os.Stderr, "  sudo %s /mnt/btrfs mysubvol -xdev\n", os.Args[0])
 }
 
+// shQuote shell-quotes s so a printed command line is copy-pasteable.
+func shQuote(s string) string {
+	if s == "" {
+		return "''"
+	}
+	for _, r := range s {
+		if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') ||
+			r == '-' || r == '_' || r == '/' || r == '.' || r == ':' || r == '=' || r == '+' || r == ',' || r == '%' || r == '@') {
+			return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+		}
+	}
+	return s
+}
+
+// shJoin quotes each arg and joins them for a copy-pasteable command line.
+func shJoin(args []string) string {
+	q := make([]string, len(args))
+	for i, a := range args {
+		q[i] = shQuote(a)
+	}
+	return strings.Join(q, " ")
+}
+
 func main() {
 	workers := flag.Int("workers", DEDUP_WORKERS, "number of parallel dedup workers")
 	startAt := flag.String("start-at", "", "resume: skip files until this relative path (lexicographic)")
@@ -1231,12 +1254,10 @@ func main() {
 		findArgs := []string{live, "-type", "f"}
 		if len(findFilter) > 0 {
 			findArgs = append(findArgs, "(")
-			for _, arg := range findFilter {
-				findArgs = append(findArgs, strings.Fields(arg)...)
-			}
+			findArgs = append(findArgs, findFilter...)
 			findArgs = append(findArgs, ")")
 		}
-		fmt.Fprintf(os.Stderr, "find %s\n", strings.Join(findArgs, " "))
+		fmt.Fprintf(os.Stderr, "find %s\n", shJoin(findArgs))
 
 		cmd := exec.Command("find", findArgs...)
 		stdout, err := cmd.StdoutPipe()
